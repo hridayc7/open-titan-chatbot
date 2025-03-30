@@ -1,0 +1,4 @@
+TODO
+1. Do a better job handling sources
+2. Make sure Claude doesn't say "in the context all the time"
+3. Make sure chat history is persistent --> maybe use a vector to store chat history 

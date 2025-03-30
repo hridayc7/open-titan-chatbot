@@ -11,6 +11,7 @@ function App() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [useTranslation, setUseTranslation] = useState(false);
+  const [sessionId, setSessionId] = useState(null);
 
   // UI state
   const [darkMode, setDarkMode] = useState(
@@ -25,10 +26,10 @@ function App() {
         return JSON.parse(savedHistory);
       } catch (e) {
         console.error('Failed to parse chat history:', e);
-        return { default: { title: 'New Chat', messages: [], timestamp: Date.now() } };
+        return { default: { title: 'New Chat', messages: [], timestamp: Date.now(), sessionId: null } };
       }
     } else {
-      return { default: { title: 'New Chat', messages: [], timestamp: Date.now() } };
+      return { default: { title: 'New Chat', messages: [], timestamp: Date.now(), sessionId: null } };
     }
   });
   const [chatMenuOpen, setChatMenuOpen] = useState(null);
@@ -67,12 +68,14 @@ function App() {
     localStorage.setItem('darkMode', darkMode);
   }, [darkMode]);
 
-  // Load current chat messages
+  // Load current chat messages and session ID
   useEffect(() => {
     if (chatHistory[currentChatId]) {
       setMessages(chatHistory[currentChatId].messages || []);
+      setSessionId(chatHistory[currentChatId].sessionId);
     } else {
       setMessages([]);
+      setSessionId(null);
     }
   }, [currentChatId, chatHistory]);
 
@@ -111,21 +114,54 @@ function App() {
   };
 
   // Create a new chat
-  const createNewChat = () => {
+  const createNewChat = async () => {
+    // Generate a new session ID for the backend conversation
     const newChatId = 'chat_' + Date.now();
+    const newSessionId = crypto.randomUUID();
+
     setChatHistory(prev => ({
-      [newChatId]: { title: 'New Chat', messages: [], timestamp: Date.now() },
+      [newChatId]: {
+        title: 'New Chat',
+        messages: [],
+        timestamp: Date.now(),
+        sessionId: newSessionId
+      },
       ...prev,
     }));
+
     setCurrentChatId(newChatId);
+    setSessionId(newSessionId);
     setMessages([]);
+
     // Close any open menus
     setChatMenuOpen(null);
     setSettingsOpen(false);
+
+    try {
+      // Optionally clear chat history on the server for the new session
+      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+      await axios.post(`${apiUrl}/api/clear-chat`, { session_id: newSessionId });
+    } catch (error) {
+      console.error('Error initializing new chat session:', error);
+    }
   };
 
   // Delete a chat
-  const deleteChat = (chatId) => {
+  const deleteChat = async (chatId) => {
+    const chatToDelete = chatHistory[chatId];
+
+    // Attempt to clear server-side chat history if we have a session ID
+    if (chatToDelete && chatToDelete.sessionId) {
+      try {
+        const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5001';
+        await axios.post(`${apiUrl}/api/clear-chat`, {
+          session_id: chatToDelete.sessionId
+        });
+      } catch (error) {
+        console.error('Error clearing server chat history:', error);
+      }
+    }
+
     if (Object.keys(chatHistory).length <= 1) {
       // If this is the last chat, create a new empty one instead of deleting
       createNewChat();
@@ -249,16 +285,31 @@ function App() {
     setLoading(true);
 
     try {
-      // Call API
+      // Call API with session ID for conversation continuity
       const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5001';
       const response = await axios.post(`${apiUrl}/api/chat`, {
         query: input,
-        use_translation: useTranslation
+        use_translation: useTranslation,
+        session_id: sessionId // Include session ID for backend conversation tracking
       });
 
       // Extract data from response
-      const { answer, sub_queries } = response.data;
+      const { answer, sub_queries, session_id: newSessionId } = response.data;
       let finalMessages = [...updatedMessages];
+
+      // If we got a new session ID (first message), save it
+      if (newSessionId && (!sessionId || sessionId !== newSessionId)) {
+        setSessionId(newSessionId);
+
+        // Update session ID in chat history
+        setChatHistory(prev => ({
+          ...prev,
+          [currentChatId]: {
+            ...prev[currentChatId],
+            sessionId: newSessionId
+          }
+        }));
+      }
 
       // Add sub-queries if present
       if (sub_queries && sub_queries.length > 0) {
@@ -352,6 +403,23 @@ function App() {
               </button>
             </div>
           ))}
+        </div>
+
+        <div className="translation-toggle">
+          <label className="toggle-label">
+            <span>Query Translation</span>
+            <div className="toggle-switch-container">
+              <input
+                type="checkbox"
+                checked={useTranslation}
+                onChange={() => setUseTranslation(!useTranslation)}
+              />
+              <span className="toggle-switch"></span>
+            </div>
+          </label>
+          <div className="toggle-description">
+            Break complex queries into simpler questions
+          </div>
         </div>
       </aside>
 

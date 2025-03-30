@@ -5,7 +5,7 @@ import pickle
 import logging
 import argparse
 from typing import List, Dict, Any, Optional
-from collections import Counter
+from collections import Counter, deque
 import anthropic
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 class OpenTitanRAG:
     """
-    OpenTitan RAG system with optional query translation.
+    OpenTitan RAG system with optional query translation and chat history.
     """
 
     def __init__(
@@ -31,7 +31,8 @@ class OpenTitanRAG:
         model: str = "claude-3-opus-20240229",
         embedding_model: str = "sentence-transformers/all-mpnet-base-v2",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        base_url: str = "https://github.com/lowRISC/opentitan/blob/master/"
+        base_url: str = "https://github.com/lowRISC/opentitan/blob/master/",
+        max_history_length: int = 20
     ):
         """Initialize the OpenTitan RAG system"""
         self.docs_dir = docs_dir
@@ -41,6 +42,11 @@ class OpenTitanRAG:
         self.embedding_model_name = embedding_model
         self.device = device
         self.base_url = base_url
+        self.max_history_length = max_history_length
+
+        # Initialize chat history storage
+        # We'll use a dictionary to store chat histories for different sessions
+        self.chat_histories = {}
 
         if not self.api_key:
             raise ValueError(
@@ -113,6 +119,41 @@ class OpenTitanRAG:
             messages=[{"role": "user", "content": prompt}]
         )
         return response.content[0].text
+
+    def get_chat_history(self, session_id: str) -> List[Dict[str, str]]:
+        """Get chat history for a specific session"""
+        if session_id not in self.chat_histories:
+            self.chat_histories[session_id] = deque(
+                maxlen=self.max_history_length)
+        return self.chat_histories[session_id]
+
+    def add_to_chat_history(self, session_id: str, query: str, answer: str):
+        """Add a query-answer pair to the chat history"""
+        if session_id not in self.chat_histories:
+            self.chat_histories[session_id] = deque(
+                maxlen=self.max_history_length)
+
+        self.chat_histories[session_id].append({
+            "query": query,
+            "answer": answer
+        })
+
+    def clear_chat_history(self, session_id: str):
+        """Clear chat history for a specific session"""
+        if session_id in self.chat_histories:
+            self.chat_histories[session_id].clear()
+
+    def format_chat_history(self, session_id: str) -> str:
+        """Format chat history as a string for inclusion in prompts"""
+        if session_id not in self.chat_histories or not self.chat_histories[session_id]:
+            return ""
+
+        history_text = "Previous conversation:\n"
+        for i, entry in enumerate(self.chat_histories[session_id]):
+            history_text += f"User: {entry['query']}\n"
+            history_text += f"Assistant: {entry['answer']}\n\n"
+
+        return history_text
 
     def _create_source_url(self, source: str) -> str:
         """
@@ -317,13 +358,14 @@ Main question: {query}"""
     def generate_answer(
         self,
         query: str,
+        session_id: str = None,
         documents: List[Dict[str, Any]] = None,
         aggregated_results: Dict[str, Any] = None,
         top_sources: int = 7,
         prompt_template: Optional[str] = None
     ) -> str:
         """
-        Generate an answer based on retrieved documents with clickable source links
+        Generate an answer based on retrieved documents and chat history (if available)
         """
         logger.info(f"Generating answer for query: {query}")
 
@@ -364,21 +406,34 @@ Main question: {query}"""
                 # Add to context with URL
                 context += f"[Source {i+1}: {source}]\nURL: {source_url}\n{doc['content']}\n\n"
 
+        # Include chat history if session_id is provided and history exists
+        chat_history = ""
+        if session_id and session_id in self.chat_histories and self.chat_histories[session_id]:
+            chat_history = self.format_chat_history(session_id)
+
         # Use custom or default prompt template
         if prompt_template is None:
-            prompt = f"""Answer the following question based ONLY on the information in the provided context.
+            prompt = f"""Answer the following question based on the information in the provided context and the conversation history (if any).
 If you cannot answer the question based solely on the context, say "I don't have enough information in the provided context to answer this question."
+
+{chat_history}
 
 Context information (including source URLs):
 {context}
 
-Question: {query}
+Current question: {query}
 
 Your answer should be thorough but concise, providing specific information from the context that directly addresses the question.
 When you reference a source, include the source number and the clickable URL like this: [Source X](URL).
-For example, if you're referencing Source 1, write: [Source 1]({source_to_url.get(1, "#")})."""
+For example, if you're referencing Source 1, write: [Source 1]({source_to_url.get(1, "#")}).
+If the question is a follow-up to a previous question in the chat history, consider that context in your answer."""
         else:
-            prompt = prompt_template.format(context=context, query=query)
+            prompt = prompt_template.format(
+                context=context,
+                query=query,
+                chat_history=chat_history,
+                source_url_example=f"[Source 1]({source_to_url.get(1, '#')})"
+            )
 
         # Generate answer
         answer = self._claude_generate(prompt, temperature=0.0)
@@ -391,6 +446,7 @@ For example, if you're referencing Source 1, write: [Source 1]({source_to_url.ge
     def process_query(
         self,
         query: str,
+        session_id: str = None,
         use_query_translation: bool = False,
         top_k: int = 5,
         top_sources: int = 7,
@@ -420,9 +476,10 @@ For example, if you're referencing Source 1, write: [Source 1]({source_to_url.ge
             }
             results["retrieval_stats"] = retrieval_stats
 
-            # Step 3: Generate answer
+            # Step 3: Generate answer with chat history
             answer = self.generate_answer(
                 query,
+                session_id=session_id,
                 aggregated_results=aggregated_results,
                 top_sources=top_sources,
                 prompt_template=prompt_template
@@ -433,15 +490,21 @@ For example, if you're referencing Source 1, write: [Source 1]({source_to_url.ge
                 query, top_k, include_clusters, verbose)
             results["documents"] = documents
 
-            # Generate answer
+            # Generate answer with chat history
             answer = self.generate_answer(
                 query,
+                session_id=session_id,
                 documents=documents,
                 top_sources=top_sources,
                 prompt_template=prompt_template
             )
 
         results["answer"] = answer
+
+        # Add this exchange to chat history if session_id is provided
+        if session_id:
+            self.add_to_chat_history(session_id, query, answer)
+
         return results
 
 
@@ -465,6 +528,8 @@ def main():
                         help="Claude model to use")
     parser.add_argument("--verbose", action="store_true",
                         help="Show detailed retrieval results")
+    parser.add_argument("--session_id", default=None,
+                        help="Session ID for maintaining chat history")
     parser.add_argument("--base_url", default="https://github.com/lowRISC/opentitan/blob/master/",
                         help="Base URL for source document links")
 
@@ -480,6 +545,7 @@ def main():
     rag = OpenTitanRAG(args.docs_dir, model=args.model, base_url=args.base_url)
     results = rag.process_query(
         query=args.query,
+        session_id=args.session_id,
         use_query_translation=args.translate,
         top_k=args.top_k,
         top_sources=args.top_sources,
