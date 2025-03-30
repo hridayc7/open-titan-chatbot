@@ -19,7 +19,4 @@ services:
         destination: /index.html
     envVars:
       - key: REACT_APP_API_URL
-        fromService:
-          name: opentitan-backend
-          type: web
-          property: url
+        value: https://opentitan-backend.onrender.com
